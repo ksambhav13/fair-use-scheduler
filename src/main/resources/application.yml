@@ -1,0 +1,25 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/ratelimiter}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+rate-limiter:
+  sqs:
+    queue-url: ${SQS_QUEUE_URL:https://sqs.us-east-1.amazonaws.com/123456789/tasks.fifo}
+    region: ${AWS_REGION:us-east-1}
+  scheduler:
+    batch-size: 50
+    idle-sleep-ms: 1500
+    lock-ttl-multiplier: 2
+    instance-id: ${HOSTNAME:local}

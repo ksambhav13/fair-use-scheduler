@@ -13,49 +13,43 @@ The scheduler enforces two layers of throughput control per tenant:
 
 ## System Context
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        rate-limiter                         │
-│                                                             │
-│  ┌──────────────────┐      ┌──────────────────────────────┐ │
-│  │  External        │      │  Scheduler (this service)    │ │
-│  │  Producers       │─────▶│                              │ │
-│  │  (write tasks    │  DB  │  reads tasks, enforces rate  │ │
-│  │   directly to    │      │  limits, dispatches to SQS   │ │
-│  │   PostgreSQL)    │      └────────────┬─────────────────┘ │
-│  └──────────────────┘                   │ SQS               │
-│                                         ▼                   │
-│                              ┌──────────────────┐           │
-│                              │  Workers         │           │
-│                              │  (consume SQS,   │           │
-│                              │   execute tasks) │           │
-│                              └──────────────────┘           │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    Producers["External Producers<br/>(write tasks directly<br/>to PostgreSQL)"]
+    Scheduler["Scheduler<br/>(reads tasks, enforces rate limits,<br/>dispatches to SQS)"]
+    Workers["Workers<br/>(consume SQS,<br/>execute tasks)"]
+    PG[("PostgreSQL<br/>tasks · tenant_configs")]
+    Redis[("Redis<br/>counters · locks · cursor")]
+    SQS[["Amazon SQS FIFO<br/>tasks.fifo"]]
 
-External state:
-  PostgreSQL  — task table, tenant_configs table
-  Redis       — counters, locks, batch cursor
-  Amazon SQS  — single FIFO queue (tasks.fifo)
+    Producers -->|INSERT tasks| PG
+    Scheduler -->|SELECT / UPDATE| PG
+    Scheduler -->|INCR / SET NX / GET| Redis
+    Scheduler -->|sendMessage| SQS
+    Workers -->|receiveMessage / deleteMessage| SQS
 ```
 
 ---
 
 ## Component Architecture
 
-```
-SchedulerManager
-  │  @PostConstruct start()  ←──  TenantConfigLoader (polls DB every 60s)
-  │  @PreDestroy   stop()
-  │
-  │  Map<tenantId, Thread>  (one virtual thread per enabled tenant)
-  │
-  └──▶ TenantSchedulerLoop  [per tenant]
-         │
-         ├── TenantConfigLoader    reads live tenant config each iteration
-         ├── SchedulerLock         Redis SET NX PX distributed lock
-         ├── ConsumptionCounter    Redis INCR+EXPIRE counters
-         ├── TaskRepository        PostgreSQL FIFO batch fetch + cursor
-         └── SqsDispatcher         AWS SQS FIFO sendMessage
+```mermaid
+graph TB
+    SM["<b>SchedulerManager</b><br/>@PostConstruct start()<br/>@PreDestroy stop()<br/>Map&lt;tenantId, Thread&gt;"]
+    TCL["<b>TenantConfigLoader</b><br/>polls DB every 60 s<br/>fires ConfigChangeEvent<br/>(ADDED / UPDATED / REMOVED)"]
+    TSL["<b>TenantSchedulerLoop</b><br/>[one virtual thread per enabled tenant]"]
+    SL["<b>SchedulerLock</b><br/>Redis SET NX PX<br/>distributed lock"]
+    CC["<b>ConsumptionCounter</b><br/>Redis INCR + EXPIRE<br/>throughput &amp; fair-usage counters"]
+    TR["<b>TaskRepository</b><br/>PostgreSQL FIFO batch fetch<br/>cursor via Redis"]
+    SD["<b>SqsDispatcher</b><br/>AWS SQS FIFO sendMessage<br/>MessageGroupId = tenantId"]
+
+    SM -->|"registers change listener"| TCL
+    SM -->|"starts virtual thread on ADDED<br/>interrupts thread on REMOVED"| TSL
+    TSL -->|"getConfig(tenantId) each iteration"| TCL
+    TSL --> SL
+    TSL --> CC
+    TSL --> TR
+    TSL --> SD
 ```
 
 ### SchedulerManager
@@ -116,6 +110,36 @@ The core dispatch loop. Each instance is scoped to one tenant and runs on its ow
 12. batch.poll()  ← advance past this task regardless of outcome
 
 13. sleep max(0, dispatchInterval - elapsed)
+```
+
+```mermaid
+flowchart TD
+    START([Loop iteration]) --> RELOAD[1. Reload config\nfrom TenantConfigLoader]
+    RELOAD --> CFG{Config absent\nor disabled?}
+    CFG -->|Yes| SLEEP5[Sleep 5 s] --> START
+    CFG -->|No| LOCK[2. Compute lock TTL\nAttempt Redis SET NX PX]
+    LOCK --> LOCKED{Lock\nacquired?}
+    LOCKED -->|No| SLEEP1[Sleep 1 s] --> START
+    LOCKED -->|Yes| FAIR[3. Read fair usage counter]
+    FAIR --> THROTTLE{fairUsageCount\n≥ fairUsageCap?}
+    THROTTLE -->|Yes| T1[isThrottled = true]
+    THROTTLE -->|No| T2[isThrottled = false]
+    T1 & T2 --> SEL[4. Select throughput\nthrottled or normal]
+    SEL --> INTERVAL[5. dispatchInterval =\nwindowDuration / throughput]
+    INTERVAL --> TCHECK{6. throughputCount\n≥ currentThroughput?}
+    TCHECK -->|Yes| WINWAIT[Sleep until\nnext window boundary] --> START
+    TCHECK -->|No| BATCH[7. Peek next task\nRefill batch from DB if empty]
+    BATCH --> TASKS{Tasks\navailable?}
+    TASKS -->|No| IDLE[Sleep idleSleepMs\ndefault 1.5 s] --> START
+    TASKS -->|Yes| REC[8. start = now]
+    REC --> SQS[9. sqsDispatcher.dispatch task\nSQS first — ADR-0003]
+    SQS --> DB[10. taskRepository.markDispatched\nUPDATE WHERE status = PENDING]
+    DB --> DISPATCHED{11. 1 row\nupdated?}
+    DISPATCHED -->|No — already dispatched| SKIP[Skip counter increments\nSQS dedup absorbs duplicate]
+    DISPATCHED -->|Yes| INC[consumptionCounter.incrementThroughput\nconsumptionCounter.incrementFairUsage\nschedulerLock.refresh]
+    SKIP & INC --> POLL[12. batch.poll\nadvance past task]
+    POLL --> PACE[13. Sleep max 0,\ndispatchInterval − elapsed]
+    PACE --> START
 ```
 
 ### TaskRepository
@@ -236,16 +260,31 @@ Each enabled tenant gets one Java virtual thread (Project Loom). Virtual threads
 
 Multiple scheduler instances can run simultaneously. Only one instance holds the active loop for a given tenant at a time, enforced by the Redis distributed lock. If the lock holder crashes, the lock expires and another instance acquires it.
 
-```
-Instance A          Instance B
-    │                   │
-    ├─ acquire lock ✓   │
-    │  (loop runs)      ├─ tryAcquire → false, sleep 1s
-    │                   ├─ tryAcquire → false, sleep 1s
-    X  (crash)          │
-    │                   │     [TTL expires]
-                        ├─ tryAcquire → true ✓
-                        │  (loop resumes)
+```mermaid
+sequenceDiagram
+    participant A as Instance A
+    participant R as Redis
+    participant B as Instance B
+
+    A->>R: SET NX lock (TTL)
+    R-->>A: OK — acquired
+    Note over A: loop running
+
+    B->>R: SET NX lock
+    R-->>B: nil — not acquired
+    Note over B: sleep 1 s, retry
+
+    B->>R: SET NX lock
+    R-->>B: nil — not acquired
+    Note over B: sleep 1 s, retry
+
+    Note over A: crash ✗
+
+    Note over R: TTL expires
+
+    B->>R: SET NX lock
+    R-->>B: OK — acquired
+    Note over B: loop resumes
 ```
 
 ### Dispatch atomicity
